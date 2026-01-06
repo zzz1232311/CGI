@@ -2,7 +2,7 @@ import json
 import os
 
 
-SYSTEM_PROMPT = """You are a helpful AI assistant. You must first think about the reasoning process in the mind and then provide the answer. The reasoning process should be enclosed within <think> and </think> tags."""
+SYSTEM_PROMPT = """A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>"""
 
 def load_dataset(dataset_path):
     
