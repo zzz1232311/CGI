@@ -1,6 +1,6 @@
 from tqdm import tqdm
 from typing import Any, Union
-
+from collections import defaultdict
 
 
 import torch
@@ -8,9 +8,11 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 
 
-from transformers import apply_chat_template
+from transformers import apply_chat_template,Trainer,GenerationConfig
 from transformers.trainer_utils import unwrap_model_for_generation
 from transformers.utils import is_compiled_module
+
+
 
 
 from accelerate.utils import (
@@ -32,26 +34,88 @@ def pad(seqs, padding_value):
 
 
 class GRPOTrainer(Trainer):
-    def __init__():
+    def __init__(
+        self,
+        model: Union[str, nn.Module],
+        reward_funcs: list,
+        args: Any = None,
+        train_dataset: Any = None,
+        eval_dataset: Any = None,
+        processing_class: Any = None,
+        callbacks: list = None,
+        optimizers: tuple = (None, None),
+    ):
+        if args is None:
+            raise ValueError("必须传入 args 参数")
 
-        return
+        # 1. 保存参数
+        self.reward_funcs = reward_funcs
+        self.num_generations = args.num_generations
+        self.beta = args.beta
+        self.max_prompt_length = args.max_prompt_length
+        self.max_completion_length = args.max_completion_length
+        
+        # 2. 初始化 Metrics
+        self._metrics = defaultdict(list)
 
+        # 3. 父类初始化
+        super().__init__(
+            model=model,
+            args=args,
+            data_collator=None,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            callbacks=callbacks,
+            optimizers=optimizers,
+        )
 
+        # 4. 【CGI优化】Ref Model 直接指向 Model
+        # 因为我们只提取梯度不更新参数，两者数学上等价，省一半显存
+        self.ref_model = self.model
+
+        # 5. 生成配置
+        if getattr(args, "generation_config", None) is not None:
+             self.generation_config = args.generation_config
+        else:
+            self.generation_config = GenerationConfig(
+                max_new_tokens=self.max_completion_length,
+                do_sample=True,
+                temperature=args.temperature if hasattr(args, "temperature") else 1.0,
+                pad_token_id=processing_class.pad_token_id,
+                eos_token_id=processing_class.eos_token_id,
+            )
+
+        # 6. vLLM 初始化
+        if hasattr(args, "use_vllm") and args.use_vllm:
+            from vllm import LLM, SamplingParams
+            model_path = model.config._name_or_path
+            
+            if self.accelerator.is_main_process:
+                # 显存控制：训练进程和vLLM进程共存
+                self.llm = LLM(
+                    model=model_path,
+                    trust_remote_code=True,
+                    dtype="auto",
+                    gpu_memory_utilization=getattr(args, "vllm_gpu_memory_utilization", 0.3), 
+                )
+            else:
+                self.llm = None
+            
+            self.sampling_params = SamplingParams(
+                temperature=args.temperature if hasattr(args, "temperature") else 1.0,
+                max_tokens=self.max_completion_length,
+            )
+            self._last_loaded_step = -1
     def _get_per_token_logps(self,model,input_ids,attention_mask,logits_to_keep):
 
         outputs = model(input_ids, attention_mask=attention_mask, use_cache=False)
         logits = outputs.logits  
 
         
-        if logits_to_keep is not None:
-            
-            pass 
-
-        
         logits = logits[:, :-1, :]
         input_ids = input_ids[:, 1:]
 
-       
         if logits_to_keep is not None:
             logits = logits[:, -logits_to_keep:, :]
             input_ids = input_ids[:, -logits_to_keep:]
