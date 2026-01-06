@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 
 
-from transformers import apply_chat_template,Trainer,GenerationConfig
+from transformers import Trainer,GenerationConfig
 from transformers.trainer_utils import unwrap_model_for_generation
 from transformers.utils import is_compiled_module
 
@@ -51,9 +51,14 @@ class GRPOTrainer(Trainer):
         
         self.reward_funcs = reward_funcs
         self.num_generations = args.num_generations
-        self.beta = args.beta
-        self.max_prompt_length = args.max_prompt_length
+        self.max_prompt_length = getattr(args, 'max_prompt_length', 1024)
         self.max_completion_length = args.max_completion_length
+        
+        print(f"[调试] GRPOTrainer 初始化:")
+        print(f"  - num_generations: {self.num_generations}")
+        print(f"  - max_prompt_length: {self.max_prompt_length}")
+        print(f"  - max_completion_length: {self.max_completion_length}")
+        print(f"  - reward_funcs 数量: {len(self.reward_funcs)}")
         
         
         self._metrics = defaultdict(list)
@@ -129,10 +134,16 @@ class GRPOTrainer(Trainer):
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example,self.processing_class)["prompt"] for example in inputs]
+        
+        print(f"\n[调试] _prepare_inputs 开始处理 {len(inputs)} 个样本")
+        print(f"  - 设备: {device}")
+        print(f"  - Prompts 数量: {len(prompts)}")
+        
         prompt_inputs = self.processing_class(prompts_text,return_tensors = 'pt',padding = True,padding_side = 'left',add_special_tokens = False)
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
 
         prompt_ids,prompt_mask = prompt_inputs["input_ids"],prompt_inputs["attention_mask"]
+        print(f"  - Prompt IDs 形状: {prompt_ids.shape}")
 
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:,-self.max_prompt_length : ]
@@ -141,7 +152,7 @@ class GRPOTrainer(Trainer):
         if self.args.use_vllm:
             if self.state.global_step != self._last_loaded_step:
                 with unwrap_model_for_generation(
-                    self.model,self.accelerator,gather_deepspeed3_params = self.args.ds3_gather_for_generation
+                    self.model,self.accelerator,gather_deepspeed3_params = getattr(self.args, 'ds3_gather_for_generation', False)
                 ) as unwrapped_model:
                     if is_compiled_module(unwrapped_model):
                         state_dict = unwrapped_model._orig_mod.state_dict()
@@ -196,10 +207,16 @@ class GRPOTrainer(Trainer):
         #         with self.accelerator.unwrap_model(self.model).disable_adapter():
         #             ref_per_token_logps = self._get_per_token_logps(self.model,prompt_completions_ids,attention_mask,logits_to_keep)
         completions = self.processing_class.batch_decode(completion_ids,skip_special_tokens = True)
+        
+        print(f"  - 生成的 completions 数量: {len(completions)}")
+        print(f"  - 是否对话格式: {is_conversational(inputs[0])}")
+        
         if is_conversational(inputs[0]):
             completions = [[{"role":"assistant","content":completion}]for completion in completions]
         prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
 
+        print(f"\n[调试] 开始计算奖励")
+        print(f"  - Reward functions 数量: {len(self.reward_funcs)}")
         rewards_per_func = torch.zeros(len(prompts),len(self.reward_funcs),device = device)
         for i, reward_func in enumerate(self.reward_funcs):
         # 收集除 prompt / completion 之外的其他字段
@@ -229,7 +246,10 @@ class GRPOTrainer(Trainer):
                 dtype=torch.float32,
                 device=device,
             )
+            print(f"  - Reward function {i} ({reward_func.__name__ if hasattr(reward_func, '__name__') else 'unknown'}): 平均={sum(output_rewards)/len(output_rewards):.4f}")
+        
         rewards = rewards_per_func.sum(dim = 1)
+        print(f"  - 总奖励: 平均={rewards.mean().item():.4f}, 最小={rewards.min().item():.4f}, 最大={rewards.max().item():.4f}")
                 
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
@@ -239,6 +259,43 @@ class GRPOTrainer(Trainer):
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
+        print(f"\n[调试] 优势计算完成")
+        print(f"  - 优势: 平均={advantages.mean().item():.4f}, 标准差={advantages.std().item():.4f}")
+        
+        # 打印每个 prompt 及其所有生成的响应、奖励和优势
+        print(f"\n{'='*80}")
+        print(f"详细生成结果 (每个 Prompt 的所有响应)")
+        print(f"{'='*80}")
+        
+        num_prompts = len(inputs)
+        for prompt_idx in range(num_prompts):
+            print(f"\n[Prompt {prompt_idx+1}/{num_prompts}]")
+            # 获取原始 prompt
+            if is_conversational(inputs[0]):
+                prompt_content = inputs[prompt_idx]["prompt"]
+                if isinstance(prompt_content, list):
+                    user_msg = [m for m in prompt_content if m.get("role") == "user"]
+                    if user_msg:
+                        print(f"问题: {user_msg[-1].get('content', '')[:200]}...")
+            else:
+                print(f"问题: {str(inputs[prompt_idx].get('prompt', ''))[:200]}...")
+            
+            # 打印该 prompt 的所有生成结果
+            for gen_idx in range(self.num_generations):
+                global_idx = prompt_idx * self.num_generations + gen_idx
+                completion_text = completions[global_idx]
+                if isinstance(completion_text, list) and len(completion_text) > 0:
+                    completion_text = completion_text[0].get("content", "")
+                
+                reward_val = rewards[global_idx].item()
+                advantage_val = advantages[global_idx].item()
+                
+                print(f"\n  生成 {gen_idx+1}:")
+                print(f"    响应: {str(completion_text)[:300]}...")
+                print(f"    奖励: {reward_val:.4f}")
+                print(f"    优势: {advantage_val:.4f}")
+        
+        print(f"\n{'='*80}\n")
         
         reward_per_func = self.accelerator.gather_for_metrics(rewards_per_func).mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
@@ -316,6 +373,10 @@ class GRPOTrainer(Trainer):
         samples_processed = 0
         steps_taken = 0
         pbar = tqdm(total = num_init_samples,desc = "样本处理进度",unit = 'sample')
+        
+        print(f"\n[调试] 开始梯度提取")
+        print(f"  - 目标样本数: {num_init_samples}")
+        print(f"  - 目标模块: {target_modules}")
 
         while samples_processed < num_init_samples:
             try:
@@ -324,12 +385,18 @@ class GRPOTrainer(Trainer):
                 iterator = iter(train_dataloader)
                 inputs = next(iterator)
             
-            bsz = 1
-            if isinstance(inputs,dict):
-                if "prompt_ids" in inputs:
-                    bsz = inputs["prompt_ids"].size(0)
-                elif "input_ids" in inputs:
-                    bsz = inputs["input_ids"].size(0)
+            # 修复：inputs 是列表，不是字典
+            print(f"\n[调试] 批次大小计算")
+            print(f"  - inputs 类型: {type(inputs)}")
+            print(f"  - isinstance(inputs, list): {isinstance(inputs, list)}")
+            if isinstance(inputs, list):
+                print(f"  - len(inputs): {len(inputs)}")
+            
+            bsz = len(inputs) if isinstance(inputs, list) else 1
+            print(f"  - 计算得到的批次大小 bsz: {bsz}")
+            print(f"  - 当前已处理样本数: {samples_processed}")
+            print(f"  - 本批次后总样本数: {samples_processed + bsz}")
+            
             self.model.zero_grad()
             with torch.set_grad_enabled(True):
                 processed_inputs = self._prepare_inputs(inputs)

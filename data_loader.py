@@ -1,12 +1,19 @@
 import json
+import os
 
 
 SYSTEM_PROMPT = """You are a helpful AI assistant. You must first think about the reasoning process in the mind and then provide the answer. The reasoning process should be enclosed within <think> and </think> tags."""
 
 def load_dataset(dataset_path):
     
-    print(f"从 {dataset_path} 加载数据集...")
+    print(f"\n[调试] 加载数据集")
+    print(f"  - 数据集路径: {dataset_path}")
     
+    # 检查文件是否存在
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"数据集文件不存在: {dataset_path}")
+    
+    print(f"  - 文件存在，开始读取...")
     data_list = []
     
     # 数据集是 jsonl 格式，每行 {"instruction": "...", "output": "..."}
@@ -37,10 +44,21 @@ def load_dataset(dataset_path):
                     "solution": row.get("output", "") 
                 }
                 data_list.append(item)
-                print(item)
-                print("-"*50)
-            except json.JSONDecodeError:
+                
+                # 调试：只打印前3条数据
+                if len(data_list) <= 3:
+                    print(f"\n  [样本 {len(data_list)}]")
+                    print(f"    指令: {user_content[:100]}...")
+                    print(f"    答案: {row.get('output', '')[:100]}...")
+                
+            except json.JSONDecodeError as e:
+                print(f"  [警告] JSON 解析错误: {e}")
                 continue
 
-    print(f"成功加载 {len(data_list)} 条数据 。")
+    print(f"\n[调试] 数据集加载完成")
+    print(f"  - 成功加载: {len(data_list)} 条数据")
+    
+    if len(data_list) == 0:
+        raise ValueError("数据集为空，请检查数据格式")
+    
     return data_list

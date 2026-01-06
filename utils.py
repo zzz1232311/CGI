@@ -7,23 +7,39 @@ from safetensors.torch import save_file
 
 def compute_and_save_svd_lora(named_grads,output_dir,rank,alpha,target_modules_set,direction = "ArBr",scale_mode = "stable",stable_gamma = 16):
     lora_state_dict = {}
-    print(f"\n[SVD分解]：Rank = {rank},Dir = {direction},Scale = {scale_mode}")
+    print(f"\n[调试] SVD分解开始")
+    print(f"  - Rank: {rank}")
+    print(f"  - Direction: {direction}")
+    print(f"  - Scale mode: {scale_mode}")
+    print(f"  - Stable gamma: {stable_gamma}")
+    print(f"  - 梯度数量: {len(named_grads)}")
+    print(f"  - 目标模块: {target_modules_set}")
 
     skipped = 0
+    processed = 0
 
     for name,grad in tqdm(named_grads.items(),desc = "lora矩阵初始化"):
         #过滤非目标层或非二维矩阵
         is_target = any(t in name for t in target_modules_set)
         if not is_target or grad.ndim != 2:
-            if is_target: skipped += 1
+            if is_target: 
+                skipped += 1
+                print(f"  [跳过] {name}: 非二维矩阵 (shape={grad.shape})")
             continue
-        grad = grad.float().cuda()
+        
+        # 修复：不硬编码 cuda()
+        grad = grad.float()
+        if torch.cuda.is_available():
+            grad = grad.cuda()
 
         #SVD分解
         try:
             U,S,V = torch.svd_lowrank(grad,q = 4 * rank,niter = 4)
-        except:
+        except Exception as e:
+            print(f"  [警告] SVD分解失败 {name}: {e}")
             continue
+        
+        processed += 1
         V = V.T
 
         #向量分配
@@ -63,8 +79,14 @@ def compute_and_save_svd_lora(named_grads,output_dir,rank,alpha,target_modules_s
         lora_state_dict[f"{prefix}.lora_B.weight"] = B_final.cpu().contiguous()
 
     #保存LoRA权重
+    print(f"\n[调试] SVD分解完成")
+    print(f"  - 处理的层数: {processed}")
+    print(f"  - 跳过的层数: {skipped}")
+    print(f"  - 生成的 LoRA 参数数量: {len(lora_state_dict)}")
+    
     os.makedirs(output_dir,exist_ok=True)
     save_file(lora_state_dict,os.path.join(output_dir,"adapter_model.safetensors"))
+    print(f"  - 保存路径: {os.path.join(output_dir, 'adapter_model.safetensors')}")
 
 
     config_dict = {

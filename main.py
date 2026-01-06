@@ -2,7 +2,7 @@ import argparse
 import torch
 import os
 
-from transformers import AutoModelForCausalLM, AutoTokenizer,TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig
 
 from grpo_init import GRPOTrainer

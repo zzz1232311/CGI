@@ -1,0 +1,10 @@
+torch>=2.0.0
+transformers>=4.36.0
+trl>=0.7.0
+safetensors>=0.4.0
+accelerate>=0.25.0
+tqdm>=4.65.0
+vllm>=0.2.0
+latex2sympy2_extended
+math_verify
+
