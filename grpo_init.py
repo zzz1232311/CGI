@@ -48,17 +48,17 @@ class GRPOTrainer(Trainer):
         if args is None:
             raise ValueError("必须传入 args 参数")
 
-        # 1. 保存参数
+        
         self.reward_funcs = reward_funcs
         self.num_generations = args.num_generations
         self.beta = args.beta
         self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length
         
-        # 2. 初始化 Metrics
+        
         self._metrics = defaultdict(list)
 
-        # 3. 父类初始化
+        
         super().__init__(
             model=model,
             args=args,
@@ -70,11 +70,11 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
-        # 4. 【CGI优化】Ref Model 直接指向 Model
-        # 因为我们只提取梯度不更新参数，两者数学上等价，省一半显存
+        # Ref Model 直接指向 Model
+       
         self.ref_model = self.model
 
-        # 5. 生成配置
+        
         if getattr(args, "generation_config", None) is not None:
              self.generation_config = args.generation_config
         else:
@@ -86,13 +86,13 @@ class GRPOTrainer(Trainer):
                 eos_token_id=processing_class.eos_token_id,
             )
 
-        # 6. vLLM 初始化
+        #vLLM 初始化
         if hasattr(args, "use_vllm") and args.use_vllm:
             from vllm import LLM, SamplingParams
             model_path = model.config._name_or_path
             
             if self.accelerator.is_main_process:
-                # 显存控制：训练进程和vLLM进程共存
+               
                 self.llm = LLM(
                     model=model_path,
                     trust_remote_code=True,

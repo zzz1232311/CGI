@@ -7,7 +7,7 @@ from trl import GRPOConfig
 
 from grpo_init import GRPOTrainer
 from data_loader import load_dataset
-from rewards import xml_count_reward    
+from rewards import think_format_reward,reasoning_accuracy_reward    
 def parse_args():
     parser = argparse.ArgumentParser()
 

@@ -34,7 +34,7 @@ def load_dataset(dataset_path):
                 item = {
                     "prompt": messages, 
                     # 需要计算正确性奖励
-                    "label": row.get("output", "") 
+                    "solution": row.get("output", "") 
                 }
                 data_list.append(item)
                 print(item)
