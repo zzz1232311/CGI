@@ -1,41 +1,30 @@
-# =========================
-# typing
-# =========================
+from tqdm import tqdm
 from typing import Any, Union
 
-# =========================
-# pytorch
-# =========================
+
+
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 
-# =========================
-# transformers
-# =========================
+
 from transformers import apply_chat_template
 from transformers.trainer_utils import unwrap_model_for_generation
 from transformers.utils import is_compiled_module
 
-# =========================
-# accelerate
-# =========================
+
 from accelerate.utils import (
     gather_object,
     broadcast_object_list,
 )
 
-# =========================
-# TRL utils（关键！）
-# =========================
+
 from trl.trainer.utils import (
     maybe_apply_chat_template,
     is_conversational,
 )
 
-# =========================
-# padding helper（TRL 没直接暴露，自己包一层）
-# =========================
+from utils import compute_and_save_svd_lora
 def pad(seqs, padding_value):
     return pad_sequence(seqs, batch_first=True, padding_value=padding_value)
 
@@ -213,6 +202,82 @@ class GRPOTrainer(Trainer):
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
         return loss
+    
+
+    def extract_gradients(self,train_dataloader,output_dir,num_init_samples = 128,lora_r = 16,lora_alpha = 32,target_modules = {'q_prog',"v_proj"},init_direction = "ArBr",init_scale = "stable"):
+        if not self.acclerator.is_main_process:
+            return
+        print("\nCGI：提取梯度并初始化LoRA参数")
+
+        self.model.train()
+        for param in self.model.parameters():
+            param.requires_grad = True
+        
+        named_grads = {}
+        hooks = {}
+
+        #注册hook收集梯度
+        def make_hook(name):
+            def hook(grad):
+                if any(t in name for t in target_modules):
+                    if name not in named_grads:
+                        named_grads[name] = grad.detach().cpu()
+                    else:
+                        named_grads[name] += grad.detach().cpu()
+                return hook
+        for name,param in self.model.named_paramters():
+            if param.requires_grad:
+                hooks.append(param.register_hook(make_hook(name)))
+        
+        #前向/反传
+        iterator = iter(train_dataloader)
+        samples_processed = 0
+        steps_taken = 0
+        pbar = tqdm(total = num_init_samples,desc = "样本处理进度",unit = 'sample')
+
+        while samples_processed < num_init_samples:
+            try:
+                inputs = next(iterator)
+            except StopIteration:
+                iterator = iter(train_dataloader)
+                inputs = next(iterator)
+            
+            bsz = 1
+            if isinstance(inputs,dict):
+                if "prompt_ids" in inputs:
+                    bsz = inputs["prompt_ids"].size(0)
+                elif "input_ids" in inputs:
+                    bsz = inputs["input_ids"].size(0)
+            self.model.zero_grad()
+            with torch.set_grad_enabled(True):
+                processed_inputs = self._prepare_inputs(inputs)
+                loss = self.compute_loss(self.model,processed_inputs)
+                self.accelerator.backward(loss)
+            
+            samples_processed += bsz
+            steps_taken += 1
+            pbar.update(bsz)
+        pbar.close()
+        for hook in hooks:
+            hook.remove()
+        
+        #求平均并保存
+        print(f"\nCGI：处理样本 {samples_processed}，梯度更新步数 {steps_taken}。开始SVD分解并保存LoRA参数。")
+        for k in named_grads:
+            named_grads[k] /= steps_taken
+        
+        compute_and_save_svd_lora(
+            named_grads = named_grads,
+            output_dir = output_dir,
+            rank = lora_r,
+            alpha = lora_alpha,
+            target_modules_set = target_modules,
+            direction = init_direction,
+            scale_mode = init_scale,
+        )
+
+        del named_grads
+        torch.cuda.empty_cache()
 
 
 
