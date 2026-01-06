@@ -39,15 +39,34 @@ class GRPOTrainer(Trainer):
 
     def _get_per_token_logps(self,model,input_ids,attention_mask,logits_to_keep):
 
-        return
+        outputs = model(input_ids, attention_mask=attention_mask, use_cache=False)
+        logits = outputs.logits  
+
+        
+        if logits_to_keep is not None:
+            
+            pass 
+
+        
+        logits = logits[:, :-1, :]
+        input_ids = input_ids[:, 1:]
+
+       
+        if logits_to_keep is not None:
+            logits = logits[:, -logits_to_keep:, :]
+            input_ids = input_ids[:, -logits_to_keep:]
+        
+       
+        return torch.gather(logits.log_softmax(-1), dim=2, index=input_ids.unsqueeze(2)).squeeze(2)
+        
 
 
-    def _prepare_inputs(self,inputs: dict[str,Union[torch.tensor,any]]) -> dict[str,Union[torch.tensor,any]]:
+    def _prepare_inputs(self,inputs: dict[str,Union[torch.Tensor,Any]]) -> dict[str,Union[torch.Tensor,Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example,self.processing_class)["prompt"] for example in inputs]
         prompt_inputs = self.processing_class(prompts_text,return_tensors = 'pt',padding = True,padding_side = 'left',add_special_tokens = False)
-        prompt_inputs = super._prepare_inputs(prompt_inputs)
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
 
         prompt_ids,prompt_mask = prompt_inputs["input_ids"],prompt_inputs["attention_mask"]
 
@@ -66,7 +85,7 @@ class GRPOTrainer(Trainer):
                         state_dict = unwrapped_model.state_dict()
                 if self.accelerator.is_main_process:
                     llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                    llm_model.loda_weights(state_dict.items())
+                    llm_model.load_weights(state_dict.items())
                 self._last_loaded_step = self.state.global_step
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
@@ -106,12 +125,12 @@ class GRPOTrainer(Trainer):
 
         logits_to_keep = completion_ids.size(1)
 
-        with torch.inference_mode():
-            if self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(self.ref_model,prompt_completions_ids,attention_mask,logits_to_keep)
-            else:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(self.model,prompt_completions_ids,attention_mask,logits_to_keep)
+        # with torch.inference_mode():
+        #     if self.ref_model is not None:
+        #         ref_per_token_logps = self._get_per_token_logps(self.ref_model,prompt_completions_ids,attention_mask,logits_to_keep)
+        #     else:
+        #         with self.accelerator.unwrap_model(self.model).disable_adapter():
+        #             ref_per_token_logps = self._get_per_token_logps(self.model,prompt_completions_ids,attention_mask,logits_to_keep)
         completions = self.processing_class.batch_decode(completion_ids,skip_special_tokens = True)
         if is_conversational(inputs[0]):
             completions = [[{"role":"assistant","content":completion}]for completion in completions]
@@ -173,7 +192,7 @@ class GRPOTrainer(Trainer):
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
-            "ref_per_token_logps": ref_per_token_logps,
+            # "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
         }
     def compute_loss(self,model,inputs,return_outputs = False,num_items_in_batch = None):
@@ -186,26 +205,25 @@ class GRPOTrainer(Trainer):
         per_token_logps = self._get_per_token_logps(model,input_ids,attention_mask,logits_to_keep)
 
         #计算策略模型与参考模型的KL散度
-        ref_per_token_logps = inputs["ref_per_token_logps"]
-        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+        # ref_per_token_logps = inputs["ref_per_token_logps"]
+        # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
         #x - x.detach() allows for preserving gradients from x
         advantages = inputs["advantages"]
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
-        per_token_loss = -(per_token_loss - self.beta * per_token_kl)
+        per_token_loss = - (per_token_logps * advantages.unsqueeze(1))
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
         
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
 
-        mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-        self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        # mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        # self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
         return loss
     
 
-    def extract_gradients(self,train_dataloader,output_dir,num_init_samples = 128,lora_r = 16,lora_alpha = 32,target_modules = {'q_prog',"v_proj"},init_direction = "ArBr",init_scale = "stable"):
-        if not self.acclerator.is_main_process:
+    def extract_gradients(self,train_dataloader,output_dir,num_init_samples = 128,lora_r = 16,lora_alpha = 32,target_modules = {'q_proj',"v_proj"},init_direction = "ArBr",init_scale = "stable"):
+        if not self.accelerator.is_main_process:
             return
         print("\nCGI：提取梯度并初始化LoRA参数")
 
@@ -214,7 +232,7 @@ class GRPOTrainer(Trainer):
             param.requires_grad = True
         
         named_grads = {}
-        hooks = {}
+        hooks = []
 
         #注册hook收集梯度
         def make_hook(name):
@@ -224,8 +242,8 @@ class GRPOTrainer(Trainer):
                         named_grads[name] = grad.detach().cpu()
                     else:
                         named_grads[name] += grad.detach().cpu()
-                return hook
-        for name,param in self.model.named_paramters():
+            return hook
+        for name,param in self.model.named_parameters():
             if param.requires_grad:
                 hooks.append(param.register_hook(make_hook(name)))
         

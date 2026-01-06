@@ -18,6 +18,7 @@ def parse_args():
     parser.add_argument("--batch_size",type=int,default=2)
     parser.add_argument("--max_length",type=int,default=512)
     parser.add_argument("--num_generations",type=int,default=8)
+    parser.add_argument("--use_vllm",action="store_true")
     parser.add_argument("--lora_rank",type=int,default=8)
     parser.add_argument("--lora_alpha",type=int,default=16)
     parser.add_argument("--direction",type=str,default="ArBr",choices=["ArBr","A2rBr","ArB2r","A_B"])
@@ -35,14 +36,14 @@ def main():
     print(f"Samples:     {args.num_samples} prompts")
     print(f"Batch Size:  {args.batch_size} prompts per step")
     print(f"Generations: {args.num_generations} responses per prompt (Real Batch = {args.batch_size * args.num_generations})")
-    print(f"Strategy:    {args.init_direction} / {args.init_scale}")
+    print(f"Strategy:    {args.direction} / {args.scale_mode}")
     print("="*50 + "\n")
 
     #加载模型
     print("加载模型")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dype = torch.bfloat16,
+        torch_dtype = torch.bfloat16,
         device_map = "auto",
         
     )
@@ -62,6 +63,7 @@ def main():
         logging_steps = 10,
         report_to = "none",
         remove_unused_columns = False,
+        use_vllm = args.use_vllm,
         bf16 = True,
     )
     
@@ -77,15 +79,15 @@ def main():
     target_modules = {"q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","fc1","fc2"}
 
   
-    trainer.extract_gradients_from_full_param(
+    trainer.extract_gradients(
         train_dataloader=trainer.get_train_dataloader(),
         output_dir=args.output_dir,
         num_init_samples=args.num_samples, 
         lora_r=args.lora_rank,
         lora_alpha=args.lora_alpha,
         target_modules=target_modules,
-        init_direction=args.init_direction,
-        init_scale=args.init_scale
+        init_direction=args.direction,
+        init_scale=args.scale_mode
     )
 
     print("\n" + "="*50)
