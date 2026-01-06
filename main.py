@@ -4,6 +4,8 @@ import os
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig
+from torch.utils.data import DataLoader
+
 
 from grpo_init import GRPOTrainer
 from data_loader import load_dataset
@@ -17,7 +19,7 @@ def parse_args():
     parser.add_argument("--num_samples",type=int,default=128)
     parser.add_argument("--batch_size",type=int,default=2)
     parser.add_argument("--max_length",type=int,default=512)
-    parser.add_argument("--num_generations",type=int,default=8)
+    parser.add_argument("--num_generations",type=int,default=2)
     parser.add_argument("--use_vllm",action="store_true")
     parser.add_argument("--lora_rank",type=int,default=8)
     parser.add_argument("--lora_alpha",type=int,default=16)
@@ -44,7 +46,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype = torch.bfloat16,
-        device_map = "auto",
+        device_map = "cuda:0",
         
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
@@ -53,6 +55,7 @@ def main():
     
     #加载数据集
     dataset = load_dataset(args.dataset_path)
+    print("[调试] 数据集字段:", dataset.column_names)
 
     #初始化config
     training_args = GRPOConfig(
@@ -77,17 +80,29 @@ def main():
 
     #梯度初始化
     target_modules = {"q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","fc1","fc2"}
+    
+    def identity_collate_fn(batch):
+    
+        return batch
+    train_dataloader = DataLoader(
+    dataset,
+    batch_size=args.batch_size,
+    shuffle=True,
+    collate_fn=identity_collate_fn,  
+    )
 
-  
+
+
+    
     trainer.extract_gradients(
-        train_dataloader=trainer.get_train_dataloader(),
-        output_dir=args.output_dir,
-        num_init_samples=args.num_samples, 
-        lora_r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        target_modules=target_modules,
-        init_direction=args.direction,
-        init_scale=args.scale_mode
+    train_dataloader=train_dataloader, 
+    output_dir=args.output_dir,
+    num_init_samples=args.num_samples,
+    lora_r=args.lora_rank,
+    lora_alpha=args.lora_alpha,
+    target_modules=target_modules,
+    init_direction=args.direction,
+    init_scale=args.scale_mode,
     )
 
     print("\n" + "="*50)

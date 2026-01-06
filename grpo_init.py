@@ -9,8 +9,13 @@ from torch.nn.utils.rnn import pad_sequence
 
 
 from transformers import Trainer,GenerationConfig
-from transformers.trainer_utils import unwrap_model_for_generation
-from transformers.utils import is_compiled_module
+try:
+    from transformers.utils import is_compiled_module
+except ImportError:
+    def is_compiled_module(module):
+        """检查模块是否被 torch.compile 编译过"""
+        return hasattr(module, "_orig_mod")
+
 
 
 
@@ -21,14 +26,91 @@ from accelerate.utils import (
 )
 
 
-from trl.trainer.utils import (
-    maybe_apply_chat_template,
-    is_conversational,
-)
+
+try:
+    from trl.trainer.utils import maybe_apply_chat_template, is_conversational
+except ImportError:
+    # 手动实现这些辅助函数
+    
+    def is_conversational(example):
+        """
+        检查样本是否为对话格式 (即 'prompt' 字段是消息列表而不是字符串)。
+        """
+        prompt = example.get("prompt")
+        # 检查是否为 list，且内部元素看起来像消息字典 (包含 'role')
+        if isinstance(prompt, list) and len(prompt) > 0:
+            if isinstance(prompt[0], dict) and "role" in prompt[0]:
+                return True
+        return False
+
+    def maybe_apply_chat_template(example, tokenizer):
+        """
+        如果样本是对话格式，则应用 tokenizer 的 chat_template 将其转换为字符串。
+        如果已经是字符串，则原样返回。
+        """
+        if is_conversational(example):
+            prompt = example["prompt"]
+            # 应用模板转换为纯文本
+            prompt_text = tokenizer.apply_chat_template(
+                prompt, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            # 返回新字典，避免修改原数据
+            return {"prompt": prompt_text}
+        
+        # 非对话格式，直接返回
+        return example
+
 
 from utils import compute_and_save_svd_lora
 def pad(seqs, padding_value):
     return pad_sequence(seqs, batch_first=True, padding_value=padding_value)
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def unwrap_model_for_generation(model, accelerator, gather_deepspeed3_params=True):
+    """
+    一个上下文管理器，用于在生成任务中解包模型。
+    功能：
+    1. 自动处理梯度检查点（生成时需要关闭，否则会报错）
+    2. 支持 DeepSpeed ZeRO-3（自动收集参数）
+    3. 兼容编译后的模型
+    """
+  
+    unwrapped_model = accelerator.unwrap_model(model)
+    
+ 
+    if hasattr(unwrapped_model, "_orig_mod"):
+        unwrapped_model = unwrapped_model._orig_mod
+
+
+    is_gradient_checkpointing = getattr(unwrapped_model, "is_gradient_checkpointing", False)
+    if is_gradient_checkpointing:
+        unwrapped_model.gradient_checkpointing_disable()
+
+
+    # 如果是 ZeRO-3，必须收集参数才能进行生成
+    try:
+        if accelerator.state.deepspeed_plugin is not None and accelerator.state.deepspeed_plugin.zero_stage == 3:
+            if not gather_deepspeed3_params:
+                yield unwrapped_model
+            else:
+                import deepspeed
+                # 使用标准的 DeepSpeed 上下文管理器，替代了 remove_hooks/add_hooks
+                with deepspeed.zero.GatheredParameters(model.parameters()):
+                    yield unwrapped_model
+        else:
+            # 非 ZeRO-3 模式，直接返回
+            yield unwrapped_model
+            
+    finally:
+        
+        if is_gradient_checkpointing:
+            unwrapped_model.gradient_checkpointing_enable()
 
 
 
@@ -89,6 +171,7 @@ class GRPOTrainer(Trainer):
                 temperature=args.temperature if hasattr(args, "temperature") else 1.0,
                 pad_token_id=processing_class.pad_token_id,
                 eos_token_id=processing_class.eos_token_id,
+                num_return_sequences=self.num_generations
             )
 
         #vLLM 初始化
@@ -102,14 +185,15 @@ class GRPOTrainer(Trainer):
                     model=model_path,
                     trust_remote_code=True,
                     dtype="auto",
-                    gpu_memory_utilization=getattr(args, "vllm_gpu_memory_utilization", 0.3), 
+                    gpu_memory_utilization=getattr(args, "vllm_gpu_memory_utilization", 0.05), 
                 )
             else:
                 self.llm = None
             
             self.sampling_params = SamplingParams(
                 temperature=args.temperature if hasattr(args, "temperature") else 1.0,
-                max_tokens=self.max_completion_length,
+                max_tokens=256,
+                n=self.num_generations
             )
             self._last_loaded_step = -1
     def _get_per_token_logps(self,model,input_ids,attention_mask,logits_to_keep):
@@ -150,45 +234,50 @@ class GRPOTrainer(Trainer):
             prompt_mask = prompt_mask[:,-self.max_prompt_length : ]
 
         if self.args.use_vllm:
-            if self.state.global_step != self._last_loaded_step:
-                with unwrap_model_for_generation(
-                    self.model,self.accelerator,gather_deepspeed3_params = getattr(self.args, 'ds3_gather_for_generation', False)
-                ) as unwrapped_model:
-                    if is_compiled_module(unwrapped_model):
-                        state_dict = unwrapped_model._orig_mod.state_dict()
-                    else:
-                        state_dict = unwrapped_model.state_dict()
-                if self.accelerator.is_main_process:
-                    llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                    llm_model.load_weights(state_dict.items())
-                self._last_loaded_step = self.state.global_step
-            all_prompts_text = gather_object(prompts_text)
-            if self.accelerator.is_main_process:
-                outputs = self.llm.generate(all_prompts_text,sampling_params = self.sampling_params,use_tqdm = False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
-            else:
-                completion_ids = [None] * len(all_prompts_text) * self.num_generations
-            completion_ids = broadcast_object_list(completion_ids,from_process = 0)
-            process_slice = slice(
-                self.accelerator.process_index * len(prompts) * self.num_generations,
-                (self.accelerator.process_index + 1 )* len(prompts) * self.num_generations, 
-            )
-            completion_ids = completion_ids[process_slice]
+            # if self.state.global_step != self._last_loaded_step:
+            #     with unwrap_model_for_generation(
+            #         self.model,self.accelerator,gather_deepspeed3_params = getattr(self.args, 'ds3_gather_for_generation', False)
+            #     ) as unwrapped_model:
+            #         if is_compiled_module(unwrapped_model):
+            #             state_dict = unwrapped_model._orig_mod.state_dict()
+            #         else:
+            #             state_dict = unwrapped_model.state_dict()
+            #     if self.accelerator.is_main_process:
+            #         llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+            #         llm_model.load_weights(state_dict.items())
+            #     self._last_loaded_step = self.state.global_step
+            # all_prompts_text = gather_object(prompts_text)
+            # if self.accelerator.is_main_process:
+            #     outputs = self.llm.generate(all_prompts_text,sampling_params = self.sampling_params,use_tqdm = False)
+            #     completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+            # else:
+            #     completion_ids = [None] * len(all_prompts_text) * self.num_generations
+            # completion_ids = broadcast_object_list(completion_ids,from_process = 0)
+            # process_slice = slice(
+            #     self.accelerator.process_index * len(prompts) * self.num_generations,
+            #     (self.accelerator.process_index + 1 )* len(prompts) * self.num_generations, 
+            # )
+            # completion_ids = completion_ids[process_slice]
 
-            completion_ids = [torch.tensor(ids,device = device)for ids in completion_ids]
-            completion_ids = pad(completion_ids,padding_value=self.processing_class.pad_token_id)
-            prompt_ids = torch.repeat_interleave(prompt_ids,self.num_generations,dim = 0)
-            prompt_mask = torch.repeat_interleave(prompt_mask,self.num_generations,dim = 0)
-            prompt_completions_ids = torch.cat([prompt_ids,completion_ids],dim = 1)
+            # completion_ids = [torch.tensor(ids,device = device)for ids in completion_ids]
+            # completion_ids = pad(completion_ids,padding_value=self.processing_class.pad_token_id)
+            # prompt_ids = torch.repeat_interleave(prompt_ids,self.num_generations,dim = 0)
+            # prompt_mask = torch.repeat_interleave(prompt_mask,self.num_generations,dim = 0)
+            # prompt_completions_ids = torch.cat([prompt_ids,completion_ids],dim = 1)
+            raise RuntimeError("LoRA 初始化阶段禁止使用 vLLM")
         else:
-            with unwrap_model_for_generation(self.model,self.accelerator) as unwrapped_model:
-                prompt_completions_ids = unwrapped_model.generate(
-                    prompt_ids,attention_mask = prompt_mask,generation_config = self.generation_config
-                )
+            with torch.no_grad():
+                with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+                    prompt_completions_ids = unwrapped_model.generate(
+                        prompt_ids,
+                        attention_mask=prompt_mask,
+                        generation_config=self.generation_config
+                    )
+
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completions_ids[:, : prompt_length]
             completion_ids = prompt_completions_ids[:,prompt_length : ]
-            prompt_mask = prompt_mask.repeat_interleave(self.num_generations,dim = 0)
+            prompt_mask = torch.ones_like(prompt_ids, dtype=torch.long, device=prompt_ids.device)
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
@@ -307,7 +396,14 @@ class GRPOTrainer(Trainer):
 
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
         self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
+        print(
+        "SHAPES | prompt_ids:", prompt_ids.shape,
+        "completion_ids:", completion_ids.shape,
+        "attention_mask:", attention_mask.shape
+        )
 
+
+        
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -399,9 +495,31 @@ class GRPOTrainer(Trainer):
             
             self.model.zero_grad()
             with torch.set_grad_enabled(True):
-                processed_inputs = self._prepare_inputs(inputs)
-                loss = self.compute_loss(self.model,processed_inputs)
-                self.accelerator.backward(loss)
+                rollout = self._prepare_inputs(inputs)
+
+                prompt_ids = rollout["prompt_ids"]           # (B, T_p)
+                completion_ids = rollout["completion_ids"]   # (B, G, T_c)
+                advantages = rollout["advantages"]            # (B, G)
+
+                for b in range(prompt_ids.size(0)):
+                    for g in range(self.num_generations):
+                        input_ids = torch.cat(
+                            [prompt_ids[b], completion_ids[b, g]], dim=0
+                        ).unsqueeze(0)
+
+                        attention_mask = torch.ones_like(input_ids)
+
+                        logps = self._get_per_token_logps(
+                            self.model,
+                            input_ids,
+                            attention_mask,
+                            logits_to_keep=completion_ids.size(-1),
+                        )
+
+                        loss = -(logps.mean() * advantages[b, g])
+
+                        self.accelerator.backward(loss)
+
             
             samples_processed += bsz
             steps_taken += 1
