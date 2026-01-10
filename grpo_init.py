@@ -171,7 +171,7 @@ class GRPOTrainer(Trainer):
                 temperature=args.temperature if hasattr(args, "temperature") else 1.0,
                 pad_token_id=processing_class.pad_token_id,
                 eos_token_id=processing_class.eos_token_id,
-                num_return_sequences=self.num_generations
+                num_return_sequences=1
             )
 
         #vLLM 初始化
@@ -232,6 +232,9 @@ class GRPOTrainer(Trainer):
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:,-self.max_prompt_length : ]
             prompt_mask = prompt_mask[:,-self.max_prompt_length : ]
+        
+        prompt_ids = prompt_ids.repeat_interleave(self.num_generations,dim = 0)
+        prompt_mask = prompt_mask.repeat_interleave(self.num_generations,dim = 0)
 
         if self.args.use_vllm:
             # if self.state.global_step != self._last_loaded_step:
@@ -274,8 +277,9 @@ class GRPOTrainer(Trainer):
                         generation_config=self.generation_config
                     )
 
+            torch.cuda.empty_cache()
             prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completions_ids[:, : prompt_length]
+           
             completion_ids = prompt_completions_ids[:,prompt_length : ]
             prompt_mask = torch.ones_like(prompt_ids, dtype=torch.long, device=prompt_ids.device)
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -495,30 +499,49 @@ class GRPOTrainer(Trainer):
             
             self.model.zero_grad()
             with torch.set_grad_enabled(True):
+
                 rollout = self._prepare_inputs(inputs)
 
-                prompt_ids = rollout["prompt_ids"]           # (B, T_p)
-                completion_ids = rollout["completion_ids"]   # (B, G, T_c)
-                advantages = rollout["advantages"]            # (B, G)
+                prompt_ids = rollout["prompt_ids"]           # (B*G, T_p)
+                completion_ids = rollout["completion_ids"]   # (B*G, T_c) ← 是 2D！
+                advantages = rollout["advantages"]           # (B*G,)
+                prompt_mask = rollout["prompt_mask"]         # (B*G, T_p)
+                completion_mask = rollout["completion_mask"] # (B*G, T_c)
 
-                for b in range(prompt_ids.size(0)):
-                    for g in range(self.num_generations):
-                        input_ids = torch.cat(
-                            [prompt_ids[b], completion_ids[b, g]], dim=0
-                        ).unsqueeze(0)
+                batch_size = prompt_ids.size(0)  # 这是 B*G
 
-                        attention_mask = torch.ones_like(input_ids)
+                # ========== 修复：直接遍历 B*G ==========
+                for idx in range(batch_size):
+                    input_ids = torch.cat([
+                        prompt_ids[idx], 
+                        completion_ids[idx]
+                    ], dim=0).unsqueeze(0)  # (1, T_p + T_c)
 
-                        logps = self._get_per_token_logps(
-                            self.model,
-                            input_ids,
-                            attention_mask,
-                            logits_to_keep=completion_ids.size(-1),
+                    attention_mask = torch.cat([
+                        prompt_mask[idx],
+                        completion_mask[idx]
+                    ], dim=0).unsqueeze(0)  # (1, T_p + T_c)
+
+                    logps = self._get_per_token_logps(
+                        self.model,
+                        input_ids,
+                        attention_mask,
+                        logits_to_keep=completion_ids.size(-1),
                         )
 
-                        loss = -(logps.mean() * advantages[b, g])
-
-                        self.accelerator.backward(loss)
+                    current_mask = completion_mask[idx].unsqueeze(0).float()  # (1, T_c)
+                    masked_logps = logps * current_mask
+                    valid_tokens = current_mask.sum()
+                    
+                    if valid_tokens > 0:
+                        mean_logps = masked_logps.sum() / valid_tokens
+                    else:
+                        mean_logps = logps.mean()
+                    
+                    loss = -(mean_logps * advantages[idx])
+                    self.accelerator.backward(loss)
+            del rollout
+            torch.cuda.empty_cache()
 
             
             samples_processed += bsz
