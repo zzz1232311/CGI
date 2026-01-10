@@ -75,7 +75,7 @@ def main():
         processing_class = tokenizer,
         args = training_args,
         train_dataset = dataset,
-        reward_funcs = [],
+        reward_funcs = [think_format_reward,reasoning_accuracy_reward],
     )
 
     #梯度初始化
