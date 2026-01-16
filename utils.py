@@ -7,7 +7,7 @@ from safetensors.torch import save_file
 
 def compute_and_save_svd_lora(named_grads,output_dir,rank,alpha,target_modules_set,direction = "ArBr",scale_mode = "stable",stable_gamma = 16):
     lora_state_dict = {}
-    print(f"\n[调试] SVD分解开始")
+    print(f"\n[debug] SVD分解开始")
     print(f"  - Rank: {rank}")
     print(f"  - Direction: {direction}")
     print(f"  - Scale mode: {scale_mode}")
@@ -27,7 +27,7 @@ def compute_and_save_svd_lora(named_grads,output_dir,rank,alpha,target_modules_s
                 print(f"  [跳过] {name}: 非二维矩阵 (shape={grad.shape})")
             continue
         
-        # 修复：不硬编码 cuda()
+        
         grad = grad.float()
         if torch.cuda.is_available():
             grad = grad.cuda()
@@ -79,7 +79,7 @@ def compute_and_save_svd_lora(named_grads,output_dir,rank,alpha,target_modules_s
         lora_state_dict[f"{prefix}.lora_B.weight"] = B_final.cpu().contiguous()
 
     #保存LoRA权重
-    print(f"\n[调试] SVD分解完成")
+    print(f"\n[debug] SVD分解完成")
     print(f"  - 处理的层数: {processed}")
     print(f"  - 跳过的层数: {skipped}")
     print(f"  - 生成的 LoRA 参数数量: {len(lora_state_dict)}")

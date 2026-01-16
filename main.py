@@ -32,7 +32,7 @@ def main():
     args = parse_args()
 
     print("\n" + "="*50)
-    print(f"*** CGI初始化LoRA矩阵 ***")
+    print(f"CGI初始化LoRA矩阵 ")
     print(f"Model:       {args.model_path}")
     print(f"Output:      {args.output_dir}")
     print(f"Samples:     {args.num_samples} prompts")
@@ -55,7 +55,7 @@ def main():
     
     #加载数据集
     dataset = load_dataset(args.dataset_path)
-    print("[调试] 数据集字段:", dataset.column_names)
+    print("[debug] 数据集字段:", dataset.column_names)
 
     #初始化config
     training_args = GRPOConfig(

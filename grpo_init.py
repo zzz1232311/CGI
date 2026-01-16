@@ -73,17 +73,9 @@ from contextlib import contextmanager
 
 @contextmanager
 def unwrap_model_for_generation(model, accelerator, gather_deepspeed3_params=True):
-    """
-    一个上下文管理器，用于在生成任务中解包模型。
-    功能：
-    1. 自动处理梯度检查点（生成时需要关闭，否则会报错）
-    2. 支持 DeepSpeed ZeRO-3（自动收集参数）
-    3. 兼容编译后的模型
-    """
-  
+    
     unwrapped_model = accelerator.unwrap_model(model)
     
- 
     if hasattr(unwrapped_model, "_orig_mod"):
         unwrapped_model = unwrapped_model._orig_mod
 
@@ -93,18 +85,18 @@ def unwrap_model_for_generation(model, accelerator, gather_deepspeed3_params=Tru
         unwrapped_model.gradient_checkpointing_disable()
 
 
-    # 如果是 ZeRO-3，必须收集参数才能进行生成
+    
     try:
         if accelerator.state.deepspeed_plugin is not None and accelerator.state.deepspeed_plugin.zero_stage == 3:
             if not gather_deepspeed3_params:
                 yield unwrapped_model
             else:
                 import deepspeed
-                # 使用标准的 DeepSpeed 上下文管理器，替代了 remove_hooks/add_hooks
+                
                 with deepspeed.zero.GatheredParameters(model.parameters()):
                     yield unwrapped_model
         else:
-            # 非 ZeRO-3 模式，直接返回
+          
             yield unwrapped_model
             
     finally:
@@ -127,16 +119,13 @@ class GRPOTrainer(Trainer):
         callbacks: list = None,
         optimizers: tuple = (None, None),
     ):
-        if args is None:
-            raise ValueError("必须传入 args 参数")
-
-        
+       
         self.reward_funcs = reward_funcs
         self.num_generations = args.num_generations
         self.max_prompt_length = getattr(args, 'max_prompt_length', 1024)
         self.max_completion_length = args.max_completion_length
         
-        print(f"[调试] GRPOTrainer 初始化:")
+        print(f"[debug] GRPOTrainer 初始化:")
         print(f"  - num_generations: {self.num_generations}")
         print(f"  - max_prompt_length: {self.max_prompt_length}")
         print(f"  - max_completion_length: {self.max_completion_length}")
@@ -326,7 +315,7 @@ class GRPOTrainer(Trainer):
                         [example[key]] * self.num_generations
                     )
 
-            # 调用 reward 函数（返回 list[float], 长度 B*G）
+            # 调用 reward 函数
             output_rewards = reward_func(
                 prompts=prompts,
                 completions=completions,
@@ -352,7 +341,7 @@ class GRPOTrainer(Trainer):
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
-        print(f"\n[调试] 优势计算完成")
+        print(f"\n[debug] 优势计算完成")
         print(f"  - 优势: 平均={advantages.mean().item():.4f}, 标准差={advantages.std().item():.4f}")
         
         # 打印每个 prompt 及其所有生成的响应、奖励和优势
@@ -474,7 +463,7 @@ class GRPOTrainer(Trainer):
         steps_taken = 0
         pbar = tqdm(total = num_init_samples,desc = "样本处理进度",unit = 'sample')
         
-        print(f"\n[调试] 开始梯度提取")
+        print(f"\n[debug] 开始梯度提取")
         print(f"  - 目标样本数: {num_init_samples}")
         print(f"  - 目标模块: {target_modules}")
 
@@ -485,8 +474,8 @@ class GRPOTrainer(Trainer):
                 iterator = iter(train_dataloader)
                 inputs = next(iterator)
             
-            # 修复：inputs 是列表，不是字典
-            print(f"\n[调试] 批次大小计算")
+            
+            print(f"\n[debug] 批次大小计算")
             print(f"  - inputs 类型: {type(inputs)}")
             print(f"  - isinstance(inputs, list): {isinstance(inputs, list)}")
             if isinstance(inputs, list):
@@ -502,25 +491,25 @@ class GRPOTrainer(Trainer):
 
                 rollout = self._prepare_inputs(inputs)
 
-                prompt_ids = rollout["prompt_ids"]           # (B*G, T_p)
-                completion_ids = rollout["completion_ids"]   # (B*G, T_c) ← 是 2D！
-                advantages = rollout["advantages"]           # (B*G,)
-                prompt_mask = rollout["prompt_mask"]         # (B*G, T_p)
-                completion_mask = rollout["completion_mask"] # (B*G, T_c)
+                prompt_ids = rollout["prompt_ids"]          
+                completion_ids = rollout["completion_ids"]  
+                advantages = rollout["advantages"]           
+                prompt_mask = rollout["prompt_mask"]        
+                completion_mask = rollout["completion_mask"] 
 
-                batch_size = prompt_ids.size(0)  # 这是 B*G
+                batch_size = prompt_ids.size(0)  
 
-                # ========== 修复：直接遍历 B*G ==========
+               
                 for idx in range(batch_size):
                     input_ids = torch.cat([
                         prompt_ids[idx], 
                         completion_ids[idx]
-                    ], dim=0).unsqueeze(0)  # (1, T_p + T_c)
+                    ], dim=0).unsqueeze(0)  
 
                     attention_mask = torch.cat([
                         prompt_mask[idx],
                         completion_mask[idx]
-                    ], dim=0).unsqueeze(0)  # (1, T_p + T_c)
+                    ], dim=0).unsqueeze(0) 
 
                     logps = self._get_per_token_logps(
                         self.model,
@@ -529,7 +518,7 @@ class GRPOTrainer(Trainer):
                         logits_to_keep=completion_ids.size(-1),
                         )
 
-                    current_mask = completion_mask[idx].unsqueeze(0).float()  # (1, T_c)
+                    current_mask = completion_mask[idx].unsqueeze(0).float()  
                     masked_logps = logps * current_mask
                     valid_tokens = current_mask.sum()
                     
