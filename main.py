@@ -17,14 +17,18 @@ def parse_args():
     parser.add_argument("--dataset_path",type=str,required=True)
     parser.add_argument("--output_dir",type=str,required=True)
     parser.add_argument("--num_samples",type=int,default=128)
-    parser.add_argument("--batch_size",type=int,default=2)
-    parser.add_argument("--max_length",type=int,default=512)
-    parser.add_argument("--num_generations",type=int,default=2)
+    parser.add_argument("--batch_size",type=int,default=8)
+    parser.add_argument("--max_length",type=int,default=1024)
+    parser.add_argument("--num_generations",type=int,default=8)
     parser.add_argument("--use_vllm",action="store_true")
     parser.add_argument("--lora_rank",type=int,default=8)
     parser.add_argument("--lora_alpha",type=int,default=16)
-    parser.add_argument("--direction",type=str,default="ArBr",choices=["ArBr","A2rBr","ArB2r","A_B"])
-    parser.add_argument("--scale_mode",type=str,default="stable",choices=["stable","gd","none"])
+    parser.add_argument("--direction", type=str, default="ArBr", choices=["ArBr", "A2rBr", "ArB2r", "A_B"])
+    parser.add_argument("--scale_mode", type=str, default="stable", choices=["stable", "gd", "none"])
+    parser.add_argument("--target_ab_norm", type=float, default=13.0,
+                        help="全局目标 ‖B@A‖_F，仅当未用 W0 自适应时生效")
+    parser.add_argument("--w0_ratio", type=float, default=0.01,
+                        help="补偿量相对 ‖W0‖ 的比例，如 0.01=1%%，有原则且 bf16 安全；传入后优先于 target_ab_norm")
 
     return parser.parse_args()
 
@@ -38,7 +42,7 @@ def main():
     print(f"Samples:     {args.num_samples} prompts")
     print(f"Batch Size:  {args.batch_size} prompts per step")
     print(f"Generations: {args.num_generations} responses per prompt (Real Batch = {args.batch_size * args.num_generations})")
-    print(f"Strategy:    {args.direction} / {args.scale_mode}")
+    print(f"Strategy:    {args.direction} / w0_ratio={args.w0_ratio} (W0 自适应)")
     print("="*50 + "\n")
 
     #加载模型
@@ -79,7 +83,13 @@ def main():
     )
 
     #梯度初始化
-    target_modules = {"q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","fc1","fc2"}
+    target_modules = { "up_proj",
+    "o_proj",
+    "v_proj",
+    "k_proj",
+    "q_proj",
+    "down_proj",
+    "gate_proj"}
     
     def identity_collate_fn(batch):
     
@@ -95,14 +105,16 @@ def main():
 
     
     trainer.extract_gradients(
-    train_dataloader=train_dataloader, 
-    output_dir=args.output_dir,
-    num_init_samples=args.num_samples,
-    lora_r=args.lora_rank,
-    lora_alpha=args.lora_alpha,
-    target_modules=target_modules,
-    init_direction=args.direction,
-    init_scale=args.scale_mode,
+        train_dataloader=train_dataloader,
+        output_dir=args.output_dir,
+        num_init_samples=args.num_samples,
+        lora_r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        target_modules=target_modules,
+        init_direction=args.direction,
+        init_scale=args.scale_mode,
+        target_ab_norm=args.target_ab_norm,
+        w0_ratio=args.w0_ratio,
     )
 
     print("\n" + "="*50)

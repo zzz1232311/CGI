@@ -13,7 +13,7 @@ try:
     from transformers.utils import is_compiled_module
 except ImportError:
     def is_compiled_module(module):
-        """检查模块是否被 torch.compile 编译过"""
+        
         return hasattr(module, "_orig_mod")
 
 
@@ -30,12 +30,10 @@ from accelerate.utils import (
 try:
     from trl.trainer.utils import maybe_apply_chat_template, is_conversational
 except ImportError:
-    # 手动实现这些辅助函数
+    
     
     def is_conversational(example):
-        """
-        检查样本是否为对话格式 (即 'prompt' 字段是消息列表而不是字符串)。
-        """
+        
         prompt = example.get("prompt")
         # 检查是否为 list，且内部元素看起来像消息字典 (包含 'role')
         if isinstance(prompt, list) and len(prompt) > 0:
@@ -44,10 +42,7 @@ except ImportError:
         return False
 
     def maybe_apply_chat_template(example, tokenizer):
-        """
-        如果样本是对话格式，则应用 tokenizer 的 chat_template 将其转换为字符串。
-        如果已经是字符串，则原样返回。
-        """
+       
         if is_conversational(example):
             prompt = example["prompt"]
             # 应用模板转换为纯文本
@@ -56,10 +51,10 @@ except ImportError:
                 tokenize=False, 
                 add_generation_prompt=True
             )
-            # 返回新字典，避免修改原数据
+            
             return {"prompt": prompt_text}
         
-        # 非对话格式，直接返回
+        
         return example
 
 
@@ -208,7 +203,7 @@ class GRPOTrainer(Trainer):
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example,self.processing_class)["prompt"] for example in inputs]
         
-        print(f"\n[调试] _prepare_inputs 开始处理 {len(inputs)} 个样本")
+        print(f"\n[debug] _prepare_inputs 开始处理 {len(inputs)} 个样本")
         print(f"  - 设备: {device}")
         print(f"  - Prompts 数量: {len(prompts)}")
         
@@ -297,7 +292,7 @@ class GRPOTrainer(Trainer):
             completions = [[{"role":"assistant","content":completion}]for completion in completions]
         prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
 
-        print(f"\n[调试] 开始计算奖励")
+        print(f"\n[debug] 开始计算奖励")
         print(f"  - Reward functions 数量: {len(self.reward_funcs)}")
         rewards_per_func = torch.zeros(len(prompts),len(self.reward_funcs),device = device)
         for i, reward_func in enumerate(self.reward_funcs):
@@ -432,10 +427,29 @@ class GRPOTrainer(Trainer):
         return loss
     
 
-    def extract_gradients(self,train_dataloader,output_dir,num_init_samples = 128,lora_r = 16,lora_alpha = 32,target_modules = {'q_proj',"v_proj"},init_direction = "ArBr",init_scale = "stable"):
+    def extract_gradients(
+        self,
+        train_dataloader,
+        output_dir,
+        num_init_samples=128,
+        lora_r=16,
+        lora_alpha=32,
+        target_modules={'q_proj', 'v_proj'},
+        init_direction="ArBr",
+        init_scale="stable",
+        target_ab_norm=13.0,
+        w0_ratio=0.01,
+    ):
         if not self.accelerator.is_main_process:
             return
         print("\nCGI：提取梯度并初始化LoRA参数")
+
+        # 收集各层 W0 的 Frobenius 范数，用于按 W0 比例控制补偿量级（有原则、不依赖 LoRA-GA）
+        named_w0_norms = {}
+        for name, param in self.model.named_parameters():
+            if any(t in name for t in target_modules) and param.ndim == 2:
+                named_w0_norms[name] = param.data.norm(p='fro').item()
+        print(f"  - 已收集 {len(named_w0_norms)} 个目标层的 ‖W0‖_F，用于 w0_ratio={w0_ratio} 自适应缩放")
 
         self.model.train()
         for param in self.model.parameters():
@@ -546,13 +560,16 @@ class GRPOTrainer(Trainer):
             named_grads[k] /= steps_taken
         
         compute_and_save_svd_lora(
-            named_grads = named_grads,
-            output_dir = output_dir,
-            rank = lora_r,
-            alpha = lora_alpha,
-            target_modules_set = target_modules,
-            direction = init_direction,
-            scale_mode = init_scale,
+            named_grads=named_grads,
+            output_dir=output_dir,
+            rank=lora_r,
+            alpha=lora_alpha,
+            target_modules_set=target_modules,
+            direction=init_direction,
+            scale_mode=init_scale,
+            target_ab_norm=target_ab_norm,
+            named_w0_norms=named_w0_norms,
+            w0_ratio=w0_ratio,
         )
 
         del named_grads
